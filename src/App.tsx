@@ -12,6 +12,7 @@ import { gradeExam, isAnswered } from "./lib/grading";
 import { clearState, loadState, saveState } from "./lib/storage";
 import { sampleJson, sampleText } from "./lib/samples";
 import { formatChoiceLabel } from "./lib/utils";
+import { parseExamWithGroq } from "./lib/groq";
 
 const QUESTION_TYPE_OPTIONS: { value: QuestionType; label: string }[] = [
   { value: "single", label: "객관식(단일)" },
@@ -40,6 +41,8 @@ export default function App() {
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [filter, setFilter] = useState<ResultFilter>("all");
   const [showAnswersInEditor, setShowAnswersInEditor] = useState<boolean>(false);
+  const [aiLoading, setAiLoading] = useState<boolean>(false);
+  const [aiError, setAiError] = useState<string>("");
 
   const createBlankQuestion = (index: number): EditableQuestion => ({
     id: `Q${index + 1}`,
@@ -143,6 +146,10 @@ export default function App() {
     ? exam.questions.filter((question) => isAnswered(question, answers[question.id] ?? null)).length
     : 0;
 
+  const hasGroqKey = Boolean(import.meta.env.VITE_GROQ_API_KEY);
+  const activeInput = inputTab === "file" ? fileContent : textContent;
+  const canRunAi = hasGroqKey && activeInput.trim().length > 0;
+
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) {
@@ -158,6 +165,7 @@ export default function App() {
 
   const handleParse = (content: string, filename?: string) => {
     setInputError("");
+    setAiError("");
     setExamData(null);
     setAnswers({});
     setFlags({});
@@ -171,6 +179,28 @@ export default function App() {
     setEditableExam(result.editable);
     setParseIssues(result.issues.map((issue) => issue.message));
     setStep("preview");
+  };
+
+  const handleAiParse = async () => {
+    if (!hasGroqKey) {
+      setAiError("Groq API 키가 필요합니다. (.env.local에 VITE_GROQ_API_KEY 설정)");
+      return;
+    }
+    const content = activeInput.trim();
+    if (!content) {
+      setAiError("텍스트를 입력하거나 파일을 선택하세요.");
+      return;
+    }
+    setAiLoading(true);
+    setAiError("");
+    try {
+      const aiExam = await parseExamWithGroq(content);
+      handleParse(JSON.stringify(aiExam), "ai.json");
+    } catch (error) {
+      setAiError(error instanceof Error ? error.message : "AI 변환에 실패했습니다.");
+    } finally {
+      setAiLoading(false);
+    }
   };
 
   const handleStartExam = () => {
@@ -490,6 +520,8 @@ export default function App() {
 
             {inputTab !== "manual" && inputError && <div className="alert error">{inputError}</div>}
 
+            {inputTab !== "manual" && aiError && <div className="alert error">{aiError}</div>}
+
             {inputTab !== "manual" && (
               <div className="button-row">
                 <button
@@ -502,6 +534,9 @@ export default function App() {
                   }
                 >
                   가져오기
+                </button>
+                <button className="btn outline" onClick={handleAiParse} disabled={!canRunAi || aiLoading}>
+                  {aiLoading ? "AI 변환 중..." : "AI로 변환"}
                 </button>
                 <button
                   className="btn ghost"
@@ -522,6 +557,9 @@ export default function App() {
                   샘플(JSON) 불러오기
                 </button>
               </div>
+            )}
+            {inputTab !== "manual" && !hasGroqKey && (
+              <div className="muted">AI 변환을 쓰려면 .env.local에 VITE_GROQ_API_KEY를 설정하세요.</div>
             )}
           </section>
         )}
