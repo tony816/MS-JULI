@@ -1,6 +1,6 @@
 const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "llama-3.1-8b-instant";
-const GROQ_MAX_TOKENS = 2000;
+const GROQ_MAX_TOKENS = 4096;
 const GROQ_TEMPERATURE = 0;
 
 interface GroqMessage {
@@ -20,6 +20,7 @@ const SYSTEM_PROMPT = [
   "If the content includes double quotes, replace them with single quotes inside text.",
   "Do not wrap the response in code fences.",
   "Keep the JSON compact to fit token limits.",
+  "Do not include explanations if none are provided.",
   "Schema:",
   "{",
   "  \"title\": string,",
@@ -43,9 +44,32 @@ const SYSTEM_PROMPT = [
   "- Omit optional fields when not needed.",
 ].join("\n");
 
+function getExpectedQuestionCount(input: string): number | null {
+  const patterns = [
+    /(?:^|\n)\s*\*{0,2}\s*문제\s*(\d+)\b/g,
+    /(?:^|\n)\s*\*{0,2}\s*Question\s*(\d+)\b/gi,
+    /(?:^|\n)\s*\*{0,2}\s*Q\s*(\d+)\b/gi,
+  ];
+  let max = 0;
+  for (const pattern of patterns) {
+    for (const match of input.matchAll(pattern)) {
+      const value = Number(match[1]);
+      if (!Number.isNaN(value)) {
+        max = Math.max(max, value);
+      }
+    }
+  }
+  return max > 0 ? max : null;
+}
+
 function buildMessages(input: string): GroqMessage[] {
+  const expectedCount = getExpectedQuestionCount(input);
+  const countHint = expectedCount
+    ? `The input contains ${expectedCount} questions. Return exactly ${expectedCount} questions with ids Q1..Q${expectedCount} in order. Do not omit any questions.`
+    : "";
+  const systemContent = countHint ? `${SYSTEM_PROMPT}\n${countHint}` : SYSTEM_PROMPT;
   return [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: systemContent },
     {
       role: "user",
       content: ["입력 텍스트:", input.trim()].join("\n"),

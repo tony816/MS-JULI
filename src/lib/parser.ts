@@ -274,6 +274,215 @@ function formatChoiceLabelForEditor(label?: string): string | null {
   return label;
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripChoiceLabel(raw: string, label: string): string {
+  const trimmed = raw.trim();
+  const normalizedLabel = label.trim();
+  if (!trimmed || !normalizedLabel) {
+    return trimmed;
+  }
+
+  const escaped = escapeRegExp(normalizedLabel);
+  const prefixPatterns = [
+    new RegExp(`^${escaped}[\\)\\.\\:]*\\s+`, "i"),
+    new RegExp(`^\\(${escaped}\\)\\s+`, "i"),
+    new RegExp(`^\\[${escaped}\\]\\s+`, "i"),
+  ];
+
+  for (const pattern of prefixPatterns) {
+    const next = trimmed.replace(pattern, "").trim();
+    if (next !== trimmed && next) {
+      return next;
+    }
+  }
+
+  const suffixPatterns = [
+    new RegExp(`\\s+\\(${escaped}\\)$`, "i"),
+    new RegExp(`\\s+\\[${escaped}\\]$`, "i"),
+    new RegExp(`\\s+${escaped}$`, "i"),
+  ];
+
+  for (const pattern of suffixPatterns) {
+    const next = trimmed.replace(pattern, "").trim();
+    if (next !== trimmed && next) {
+      return next;
+    }
+  }
+
+  return trimmed;
+}
+
+function parseTrailingChoiceLabel(raw: string): { text: string; label?: string } {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { text: trimmed };
+  }
+  const match = trimmed.match(
+    /^(.*?)(?:\s+|\s*[\(\[])([A-Za-z]|[0-9]{1,2}|[①②③④⑤⑥⑦⑧⑨⑩])[\)\]]?$/
+  );
+  if (!match) {
+    return { text: trimmed };
+  }
+  const text = match[1]?.trim() ?? "";
+  const label = match[2]?.trim();
+  if (!text || !label) {
+    return { text: trimmed };
+  }
+  return { text, label };
+}
+
+function normalizeChoicesFromJson(
+  rawChoices: string[],
+  rawChoiceLabels?: string[]
+): { choices: string[]; choiceLabels?: string[] } {
+  const choices: string[] = [];
+  const labelsFromChoice: Array<string | undefined> = [];
+  const parsedFlags: boolean[] = [];
+  const trailingLabels: Array<string | undefined> = [];
+  const trailingChoices: Array<string | undefined> = [];
+  let trailingCount = 0;
+
+  rawChoices.forEach((raw) => {
+    const trimmed = String(raw ?? "").trim();
+    const token = parseChoiceLine(trimmed);
+    if (token) {
+      choices.push(normalizeChoiceToken(token.text));
+      labelsFromChoice.push(token.label?.trim());
+      parsedFlags.push(true);
+      trailingLabels.push(undefined);
+      trailingChoices.push(undefined);
+      return;
+    }
+
+    choices.push(normalizeChoiceToken(trimmed));
+    labelsFromChoice.push(undefined);
+    parsedFlags.push(false);
+
+    const trailing = parseTrailingChoiceLabel(trimmed);
+    if (trailing.label) {
+      trailingLabels.push(trailing.label);
+      trailingChoices.push(trailing.text);
+      trailingCount += 1;
+    } else {
+      trailingLabels.push(undefined);
+      trailingChoices.push(undefined);
+    }
+  });
+
+  const providedLabels =
+    rawChoiceLabels && rawChoiceLabels.length === rawChoices.length
+      ? rawChoiceLabels.map((label) => label.trim())
+      : undefined;
+
+  let choiceLabels =
+    providedLabels ||
+    (labelsFromChoice.some((label) => Boolean(label))
+      ? labelsFromChoice.map((label) => label || undefined)
+      : undefined);
+
+  let normalizedChoices = choices;
+  if (choiceLabels) {
+    const mergedLabels = choiceLabels.map((label, index) => label || trailingLabels[index]);
+    if (mergedLabels.some((label) => Boolean(label))) {
+      choiceLabels = mergedLabels;
+    }
+  } else if (trailingCount >= 2) {
+    choiceLabels = trailingLabels.some((label) => Boolean(label))
+      ? trailingLabels.map((label) => label || undefined)
+      : undefined;
+  }
+
+  if (choiceLabels) {
+    normalizedChoices = normalizedChoices.map((choice, index) => {
+      if (parsedFlags[index]) {
+        return choice;
+      }
+      const trailingChoice = trailingChoices[index];
+      if (trailingChoice) {
+        return normalizeChoiceToken(trailingChoice);
+      }
+      const label = choiceLabels?.[index];
+      if (!label) {
+        return choice;
+      }
+      const stripped = stripChoiceLabel(String(rawChoices[index] ?? ""), label);
+      return normalizeChoiceToken(stripped || choice);
+    });
+
+    if (!choiceLabels.some((label) => Boolean(label))) {
+      choiceLabels = undefined;
+    }
+  }
+
+  return { choices: normalizedChoices, choiceLabels };
+}
+
+function collectNumericAnswers(value: unknown): number[] {
+  if (typeof value === "number") {
+    return [value];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) => collectNumericAnswers(entry));
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return [];
+    }
+    if (/^\d+$/.test(trimmed)) {
+      return [Number(trimmed)];
+    }
+    const tokens = trimmed.split(/[\s,\/|;]+/).filter(Boolean);
+    return tokens
+      .map((token) => Number(token))
+      .filter((token) => !Number.isNaN(token));
+  }
+  return [];
+}
+
+function inferAnswerIndexBase(rawQuestions: unknown[]): "zero" | "one" | null {
+  let sawZero = false;
+  let sawMax = false;
+
+  rawQuestions.forEach((raw) => {
+    if (!raw || typeof raw !== "object") {
+      return;
+    }
+    const item = raw as Record<string, unknown>;
+    const choiceCount = Array.isArray(item.choices) ? item.choices.length : 0;
+    if (!choiceCount) {
+      return;
+    }
+    const numbers = collectNumericAnswers(item.answer ?? item.answerText);
+    numbers.forEach((value) => {
+      if (value === 0) {
+        sawZero = true;
+      }
+      if (value === choiceCount) {
+        sawMax = true;
+      }
+    });
+  });
+
+  if (sawZero && !sawMax) {
+    return "zero";
+  }
+  if (sawMax && !sawZero) {
+    return "one";
+  }
+  return null;
+}
+
+function shouldPreferOneBased(choiceLabels?: string[]): boolean {
+  if (!choiceLabels || !choiceLabels.length) {
+    return false;
+  }
+  return choiceLabels.some((label) => Boolean(label) && !/^\d+$/.test(label));
+}
+
 function normalizeJsonInput(parsed: unknown): { exam: ExamData | null; issues: ParseIssue[] } {
   const issues: ParseIssue[] = [];
   let title = "무제 시험";
@@ -294,8 +503,9 @@ function normalizeJsonInput(parsed: unknown): { exam: ExamData | null; issues: P
     return { exam: null, issues };
   }
 
+  const indexBase = inferAnswerIndexBase(rawQuestions);
   const questions: Question[] = rawQuestions.map((raw, index) =>
-    normalizeJsonQuestion(raw, index, issues)
+    normalizeJsonQuestion(raw, index, issues, indexBase)
   );
 
   return {
@@ -307,7 +517,12 @@ function normalizeJsonInput(parsed: unknown): { exam: ExamData | null; issues: P
   };
 }
 
-function normalizeJsonQuestion(raw: unknown, index: number, issues: ParseIssue[]): Question {
+function normalizeJsonQuestion(
+  raw: unknown,
+  index: number,
+  issues: ParseIssue[],
+  indexBase?: "zero" | "one" | null
+): Question {
   const fallbackId = `Q${index + 1}`;
   if (!raw || typeof raw !== "object") {
     issues.push({ level: "warn", message: "문제 형식이 올바르지 않습니다.", questionId: fallbackId });
@@ -326,10 +541,18 @@ function normalizeJsonQuestion(raw: unknown, index: number, issues: ParseIssue[]
   const rawChoiceLabels = Array.isArray(item.choiceLabels)
     ? item.choiceLabels.map((label) => String(label).trim())
     : undefined;
-  const choiceLabels =
-    rawChoiceLabels && rawChoiceLabels.length === rawChoices.length ? rawChoiceLabels : undefined;
+  const { choices: normalizedChoices, choiceLabels } = normalizeChoicesFromJson(
+    rawChoices,
+    rawChoiceLabels
+  );
+  const effectiveIndexBase =
+    indexBase === "one" || indexBase === "zero"
+      ? indexBase
+      : shouldPreferOneBased(choiceLabels)
+        ? "one"
+        : undefined;
 
-  if ((type === "single" || type === "multi") && !rawChoices.length) {
+  if ((type === "single" || type === "multi") && !normalizedChoices.length) {
     issues.push({ level: "warn", message: "보기가 없습니다.", questionId: id });
   }
 
@@ -349,7 +572,7 @@ function normalizeJsonQuestion(raw: unknown, index: number, issues: ParseIssue[]
   }
 
   if (type === "ox") {
-    const oxAnswer = normalizeOxAnswer(item.answer ?? item.answerText);
+    const oxAnswer = normalizeOxAnswer(item.answer ?? item.answerText, effectiveIndexBase);
     if (oxAnswer === undefined) {
       issues.push({ level: "warn", message: "O/X 정답을 확인하세요.", questionId: id });
     }
@@ -365,7 +588,11 @@ function normalizeJsonQuestion(raw: unknown, index: number, issues: ParseIssue[]
     };
   }
 
-  const parsedIndices = normalizeChoiceAnswer(item.answer ?? item.answerText, rawChoices);
+  const parsedIndices = normalizeChoiceAnswer(
+    item.answer ?? item.answerText,
+    normalizedChoices,
+    effectiveIndexBase
+  );
   if (!parsedIndices.length) {
     issues.push({ level: "warn", message: "정답을 확인하세요.", questionId: id });
   }
@@ -375,7 +602,7 @@ function normalizeJsonQuestion(raw: unknown, index: number, issues: ParseIssue[]
       id,
       type,
       prompt,
-      choices: rawChoices,
+      choices: normalizedChoices,
       choiceLabels,
       answer: parsedIndices,
       explanation,
@@ -386,7 +613,7 @@ function normalizeJsonQuestion(raw: unknown, index: number, issues: ParseIssue[]
     id,
     type: "single",
     prompt,
-    choices: rawChoices,
+    choices: normalizedChoices,
     choiceLabels,
     answer: parsedIndices[0],
     explanation,
@@ -435,8 +662,16 @@ function normalizeShortAnswers(item: Record<string, unknown>): string[] {
   return [];
 }
 
-function normalizeOxAnswer(value: unknown): number | undefined {
+function normalizeOxAnswer(value: unknown, indexBase?: "zero" | "one"): number | undefined {
   if (typeof value === "number") {
+    if (indexBase === "one") {
+      if (value === 1) {
+        return 0;
+      }
+      if (value === 2) {
+        return 1;
+      }
+    }
     return value === 0 ? 0 : 1;
   }
   if (typeof value === "string") {
@@ -452,15 +687,56 @@ function normalizeOxAnswer(value: unknown): number | undefined {
   return undefined;
 }
 
-function normalizeChoiceAnswer(value: unknown, choices: string[]): number[] {
+function normalizeChoiceAnswer(
+  value: unknown,
+  choices: string[],
+  indexBase?: "zero" | "one"
+): number[] {
+  const normalizeIndex = (index: number): number | null => {
+    if (!Number.isFinite(index)) {
+      return null;
+    }
+    if (indexBase === "one") {
+      if (choices.length > 0 && index >= 1 && index <= choices.length) {
+        return index - 1;
+      }
+      if (index === 0) {
+        return 0;
+      }
+      return index;
+    }
+    if (indexBase === "zero") {
+      return index;
+    }
+    if (choices.length > 0 && index === choices.length) {
+      return index - 1;
+    }
+    return index;
+  };
+
   if (Array.isArray(value)) {
-    const indices = value
-      .map((entry) => normalizeChoiceAnswer(entry, choices))
-      .flat();
+    const indices: number[] = [];
+    value.forEach((entry) => {
+      if (typeof entry === "number") {
+        const normalized = normalizeIndex(entry);
+        if (normalized !== null) {
+          indices.push(normalized);
+        }
+        return;
+      }
+      if (typeof entry === "string") {
+        indices.push(...extractIndicesFromText(entry, choices));
+        return;
+      }
+      if (Array.isArray(entry)) {
+        indices.push(...normalizeChoiceAnswer(entry, choices, indexBase));
+      }
+    });
     return Array.from(new Set(indices)).filter((idx) => idx >= 0);
   }
   if (typeof value === "number") {
-    return [value];
+    const normalized = normalizeIndex(value);
+    return normalized === null ? [] : [normalized];
   }
   if (typeof value === "string") {
     return extractIndicesFromText(value, choices);

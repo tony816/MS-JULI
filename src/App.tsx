@@ -4,11 +4,13 @@ import type {
   AppStep,
   EditableExam,
   EditableQuestion,
+  Question,
   QuestionType,
   UserAnswer,
 } from "./lib/types";
 import { editableToExam, parseInput, toEditableExam } from "./lib/parser";
 import { gradeExam, isAnswered } from "./lib/grading";
+import type { QuestionResult } from "./lib/grading";
 import { clearState, loadState, saveState } from "./lib/storage";
 import { sampleJson, sampleText } from "./lib/samples";
 import { formatChoiceLabel } from "./lib/utils";
@@ -242,23 +244,77 @@ export default function App() {
     setFlags((prev) => ({ ...prev, [questionId]: !prev[questionId] }));
   };
 
-  const handleExportWrongNotes = (format: "json" | "text") => {
+  const getCorrectChoiceIndices = (question: Question): number[] => {
+    if (question.type === "multi") {
+      return Array.isArray(question.answer) ? question.answer : [];
+    }
+    if (question.type === "single" || question.type === "ox") {
+      return typeof question.answer === "number" ? [question.answer] : [];
+    }
+    return [];
+  };
+
+  const formatChoiceLine = (question: Question, index: number): string => {
+    const label = formatChoiceLabel(question, index);
+    const choiceText = question.choices?.[index];
+    if (!choiceText || choiceText === label) {
+      return label;
+    }
+    return `${label} ${choiceText}`;
+  };
+
+  const formatChoiceLines = (question: Question): string[] => {
+    const choices = question.choices ?? [];
+    return choices.map((_, index) => `- ${formatChoiceLine(question, index)}`);
+  };
+
+  const formatIncorrectChoices = (question: Question): string => {
+    const choices = question.choices ?? [];
+    if (!choices.length) {
+      return "없음";
+    }
+    const correctIndices = getCorrectChoiceIndices(question);
+    if (!correctIndices.length) {
+      return "없음";
+    }
+    const correctSet = new Set(correctIndices);
+    const incorrect = choices
+      .map((_, index) => (correctSet.has(index) ? null : formatChoiceLine(question, index)))
+      .filter(Boolean) as string[];
+    return incorrect.length ? incorrect.join(", ") : "없음";
+  };
+
+  const buildDetailedNote = (
+    question: Question,
+    result: QuestionResult,
+    options: { includeFlagNote?: boolean; reasonLabel?: string } = {}
+  ): string => {
+    const choiceLines = formatChoiceLines(question);
+    const incorrectChoices = formatIncorrectChoices(question);
+    return [
+      `문항 ${question.id}`,
+      options.reasonLabel ? `분류: ${options.reasonLabel}` : "",
+      question.prompt,
+      options.includeFlagNote
+        ? "메모: 맞거나 틀림에 관계없이 질문 및 선택지까지 완전하게 이해되지 못한 문제입니다."
+        : "",
+      choiceLines.length ? `보기:\n${choiceLines.join("\n")}` : "",
+      `내 답: ${result.userAnswerLabel}`,
+      `정답: ${result.correctAnswerLabel}`,
+      `오답 보기: ${incorrectChoices}`,
+      result.explanation ? `해설: ${result.explanation}` : "",
+      "-".repeat(24),
+    ]
+      .filter(Boolean)
+      .join("\n");
+  };
+
+  const handleExportWrongNotes = () => {
     if (!exam || !summary) {
       return;
     }
 
     const wrongResults = summary.results.filter((result) => !result.correct);
-    if (format === "json") {
-      const payload = {
-        title: exam.title,
-        total: summary.total,
-        incorrect: summary.incorrect,
-        wrongNotes: wrongResults,
-      };
-      downloadFile("wrong-notes.json", JSON.stringify(payload, null, 2), "application/json");
-      return;
-    }
-
     const textPayload = wrongResults
       .map((result) => {
         return [
@@ -275,6 +331,65 @@ export default function App() {
       .join("\n");
 
     downloadFile("wrong-notes.txt", textPayload || "오답이 없습니다.", "text/plain");
+  };
+
+  const handleExportFlaggedNotes = () => {
+    if (!exam || !summary) {
+      return;
+    }
+
+    const resultMap = new Map(summary.results.map((result) => [result.id, result]));
+    const flaggedQuestions = exam.questions.filter((question) => flags[question.id]);
+    const textPayload = flaggedQuestions
+      .map((question) => {
+        const result = resultMap.get(question.id);
+        if (!result) {
+          return "";
+        }
+        return buildDetailedNote(question, result, { includeFlagNote: true });
+      })
+      .filter(Boolean)
+      .join("\n");
+
+    downloadFile("flagged-notes.txt", textPayload || "플래그 문항이 없습니다.", "text/plain");
+  };
+
+  const handleExportCombinedNotes = () => {
+    if (!exam || !summary) {
+      return;
+    }
+
+    const resultMap = new Map(summary.results.map((result) => [result.id, result]));
+    const flaggedIds = new Set(Object.keys(flags).filter((id) => flags[id]));
+    const wrongIds = new Set(summary.results.filter((result) => !result.correct).map((result) => result.id));
+
+    const textPayload = exam.questions
+      .filter((question) => flaggedIds.has(question.id) || wrongIds.has(question.id))
+      .map((question) => {
+        const result = resultMap.get(question.id);
+        if (!result) {
+          return "";
+        }
+        const reasons: string[] = [];
+        if (flaggedIds.has(question.id)) {
+          reasons.push("플래그");
+        }
+        if (wrongIds.has(question.id)) {
+          reasons.push("오답");
+        }
+        return buildDetailedNote(question, result, {
+          includeFlagNote: flaggedIds.has(question.id),
+          reasonLabel: reasons.join("+"),
+        });
+      })
+      .filter(Boolean)
+      .join("\n");
+
+    downloadFile(
+      "flagged-wrong-notes.txt",
+      textPayload || "플래그 또는 오답 문항이 없습니다.",
+      "text/plain"
+    );
   };
 
   const editorMeta = editableExam ? (
@@ -808,11 +923,14 @@ export default function App() {
                 ))}
 
                 <div className="button-row">
-                  <button className="btn outline" onClick={() => handleExportWrongNotes("text")}>
+                  <button className="btn outline" onClick={handleExportWrongNotes}>
                     오답노트(텍스트)
                   </button>
-                  <button className="btn outline" onClick={() => handleExportWrongNotes("json")}>
-                    오답노트(JSON)
+                  <button className="btn outline" onClick={handleExportFlaggedNotes}>
+                    플래그 노트(텍스트)
+                  </button>
+                  <button className="btn outline" onClick={handleExportCombinedNotes}>
+                    플래그+오답(텍스트)
                   </button>
                 </div>
               </div>
@@ -878,4 +996,3 @@ function downloadFile(filename: string, content: string, type: string) {
   link.click();
   URL.revokeObjectURL(url);
 }
-
