@@ -11,8 +11,9 @@ npm install
 npm run dev
 ```
 
-## AI 변환 (Groq)
+## AI 변환/채점 (Groq)
 - `.env.local`에 `VITE_GROQ_API_KEY`를 설정하면 입력 텍스트를 Groq로 JSON 변환할 수 있습니다.
+- 같은 키로 Groq AI 채점을 실행할 수 있습니다. (키가 없으면 로컬 채점 사용)
 - 브라우저에서 직접 호출하므로 키가 노출됩니다. 배포 시에는 서버 프록시 사용을 권장합니다.
 
 

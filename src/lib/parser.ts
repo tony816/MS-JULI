@@ -452,7 +452,12 @@ function inferAnswerIndexBase(rawQuestions: unknown[]): "zero" | "one" | null {
       return;
     }
     const item = raw as Record<string, unknown>;
-    const choiceCount = Array.isArray(item.choices) ? item.choices.length : 0;
+    let choiceCount = 0;
+    if (Array.isArray(item.choices)) {
+      choiceCount = item.choices.length;
+    } else if (item.choices && typeof item.choices === "object") {
+      choiceCount = Object.keys(item.choices as Record<string, unknown>).length;
+    }
     if (!choiceCount) {
       return;
     }
@@ -530,17 +535,30 @@ function normalizeJsonQuestion(
   }
 
   const item = raw as Record<string, unknown>;
-  const id = typeof item.id === "string" && item.id.trim() ? item.id.trim() : fallbackId;
+  const id =
+    typeof item.id === "string" && item.id.trim()
+      ? item.id.trim()
+      : typeof item.id === "number" && Number.isFinite(item.id)
+        ? `Q${item.id}`
+        : fallbackId;
   const prompt = typeof item.prompt === "string" ? item.prompt : "";
   const type = normalizeQuestionType(item.type, item, issues, id);
   const explanation = typeof item.explanation === "string" ? item.explanation : undefined;
 
-  const rawChoices = Array.isArray(item.choices)
-    ? item.choices.map((choice) => String(choice))
-    : [];
-  const rawChoiceLabels = Array.isArray(item.choiceLabels)
-    ? item.choiceLabels.map((label) => String(label).trim())
-    : undefined;
+  let rawChoices: string[] = [];
+  let rawChoiceLabels: string[] | undefined;
+
+  if (Array.isArray(item.choices)) {
+    rawChoices = item.choices.map((choice) => String(choice));
+  } else if (item.choices && typeof item.choices === "object") {
+    const entries = Object.entries(item.choices as Record<string, unknown>);
+    rawChoices = entries.map(([, value]) => String(value));
+    rawChoiceLabels = entries.map(([key]) => String(key).trim());
+  }
+
+  if (Array.isArray(item.choiceLabels)) {
+    rawChoiceLabels = item.choiceLabels.map((label) => String(label).trim());
+  }
   const { choices: normalizedChoices, choiceLabels } = normalizeChoicesFromJson(
     rawChoices,
     rawChoiceLabels
@@ -628,15 +646,27 @@ function normalizeQuestionType(
 ): QuestionType {
   if (typeof rawType === "string") {
     const normalized = rawType.toLowerCase();
-    if (["single", "multi", "short", "ox", "truefalse", "tf"].includes(normalized)) {
-      if (normalized === "truefalse" || normalized === "tf") {
-        return "ox";
-      }
+    if (["truefalse", "tf"].includes(normalized)) {
+      return "ox";
+    }
+    if (["mcq", "multiplechoice", "multiple-choice", "singlechoice", "single-choice"].includes(normalized)) {
+      return "single";
+    }
+    if (["multi", "multipleanswer", "multiple-answer", "checkbox"].includes(normalized)) {
+      return "multi";
+    }
+    if (["single", "short", "ox"].includes(normalized)) {
       return normalized as QuestionType;
     }
   }
 
-  const hasChoices = Array.isArray(item.choices) && item.choices.length > 0;
+  const hasChoicesArray = Array.isArray(item.choices) && item.choices.length > 0;
+  const hasChoicesObject =
+    !Array.isArray(item.choices) &&
+    item.choices &&
+    typeof item.choices === "object" &&
+    Object.keys(item.choices as Record<string, unknown>).length > 0;
+  const hasChoices = hasChoicesArray || hasChoicesObject;
   const hasShort = item.answerText || typeof item.answer === "string";
   if (hasChoices) {
     return "single";

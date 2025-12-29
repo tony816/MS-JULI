@@ -10,11 +10,11 @@ import type {
 } from "./lib/types";
 import { editableToExam, parseInput, toEditableExam } from "./lib/parser";
 import { gradeExam, isAnswered } from "./lib/grading";
-import type { QuestionResult } from "./lib/grading";
+import type { GradeSummary, QuestionResult } from "./lib/grading";
 import { clearState, loadState, saveState } from "./lib/storage";
 import { sampleJson, sampleText } from "./lib/samples";
 import { formatChoiceLabel } from "./lib/utils";
-import { parseExamWithGroq } from "./lib/groq";
+import { gradeExamWithGroq, parseExamWithGroq } from "./lib/groq";
 
 const QUESTION_TYPE_OPTIONS: { value: QuestionType; label: string }[] = [
   { value: "single", label: "객관식(단일)" },
@@ -45,6 +45,10 @@ export default function App() {
   const [showAnswersInEditor, setShowAnswersInEditor] = useState<boolean>(false);
   const [aiLoading, setAiLoading] = useState<boolean>(false);
   const [aiError, setAiError] = useState<string>("");
+  const [gradingLoading, setGradingLoading] = useState<boolean>(false);
+  const [gradingError, setGradingError] = useState<string>("");
+  const [gradingSummary, setGradingSummary] = useState<GradeSummary | null>(null);
+  const [gradingMode, setGradingMode] = useState<"local" | "groq">("local");
 
   const createBlankQuestion = (index: number): EditableQuestion => ({
     id: `Q${index + 1}`,
@@ -62,6 +66,13 @@ export default function App() {
 
   const ensureEditableExam = () => {
     setEditableExam((prev) => prev ?? createEmptyExam());
+  };
+
+  const resetGradingState = () => {
+    setGradingLoading(false);
+    setGradingError("");
+    setGradingSummary(null);
+    setGradingMode("local");
   };
 
   const updateQuestionAt = (index: number, updates: Partial<EditableQuestion>) => {
@@ -136,12 +147,14 @@ export default function App() {
     return editableToExam(examData).exam;
   }, [examData]);
 
-  const summary = useMemo(() => {
+  const localSummary = useMemo(() => {
     if (!exam) {
       return null;
     }
     return gradeExam(exam, answers);
   }, [exam, answers]);
+
+  const summary = gradingMode === "groq" ? gradingSummary : localSummary;
 
   const examQuestionCount = exam?.questions.length ?? 0;
   const answeredCount = exam
@@ -168,6 +181,7 @@ export default function App() {
   const handleParse = (content: string, filename?: string) => {
     setInputError("");
     setAiError("");
+    resetGradingState();
     setExamData(null);
     setAnswers({});
     setFlags({});
@@ -193,6 +207,10 @@ export default function App() {
       setAiError("텍스트를 입력하거나 파일을 선택하세요.");
       return;
     }
+    if (content.startsWith("{") || content.startsWith("[")) {
+      handleParse(content, "input.json");
+      return;
+    }
     setAiLoading(true);
     setAiError("");
     try {
@@ -205,12 +223,41 @@ export default function App() {
     }
   };
 
+  const handleGradeExam = async () => {
+    if (!exam) {
+      return;
+    }
+    setGradingError("");
+    setGradingSummary(null);
+    setGradingLoading(false);
+
+    if (!hasGroqKey) {
+      setGradingMode("local");
+      setStep("result");
+      return;
+    }
+
+    setGradingMode("groq");
+    setStep("result");
+    setGradingLoading(true);
+    try {
+      const aiSummary = await gradeExamWithGroq(exam, answers);
+      setGradingSummary(aiSummary);
+    } catch (error) {
+      setGradingError(error instanceof Error ? error.message : "AI 채점에 실패했습니다.");
+      setGradingMode("local");
+    } finally {
+      setGradingLoading(false);
+    }
+  };
+
   const handleStartExam = () => {
     if (!editableExam) {
       return;
     }
     const { exam: normalizedExam, issues } = editableToExam(editableExam);
     setParseIssues(issues.map((issue) => issue.message));
+    resetGradingState();
     if (!normalizedExam.questions.length) {
       setInputError("문제 데이터를 확인하세요.");
       return;
@@ -225,6 +272,7 @@ export default function App() {
 
   const handleReset = () => {
     clearState();
+    resetGradingState();
     setEditableExam(null);
     setExamData(null);
     setAnswers({});
@@ -238,6 +286,7 @@ export default function App() {
 
   const handleAnswerChange = (questionId: string, value: UserAnswer) => {
     setAnswers((prev) => ({ ...prev, [questionId]: value }));
+    resetGradingState();
   };
 
   const handleToggleFlag = (questionId: string) => {
@@ -674,7 +723,7 @@ export default function App() {
               </div>
             )}
             {inputTab !== "manual" && !hasGroqKey && (
-              <div className="muted">AI 변환을 쓰려면 .env.local에 VITE_GROQ_API_KEY를 설정하세요.</div>
+              <div className="muted">AI 변환/채점을 쓰려면 .env.local에 VITE_GROQ_API_KEY를 설정하세요.</div>
             )}
           </section>
         )}
@@ -745,13 +794,19 @@ export default function App() {
                 >
                   시험 편집
                 </button>
-                <button className="btn ghost" onClick={() => setAnswers({})}>
+                <button
+                  className="btn ghost"
+                  onClick={() => {
+                    setAnswers({});
+                    resetGradingState();
+                  }}
+                >
                   답안 초기화
                 </button>
               </div>
               <div className="button-row">
-                <button className="btn primary" onClick={() => setStep("result")}>
-                  전체 채점하기
+                <button className="btn primary" onClick={handleGradeExam} disabled={gradingLoading}>
+                  {gradingLoading ? "AI 채점 중..." : hasGroqKey ? "AI 채점하기" : "전체 채점하기"}
                 </button>
               </div>
             </aside>
@@ -856,13 +911,16 @@ export default function App() {
           </section>
         )}
 
-        {step === "result" && exam && summary && (
+        {step === "result" && exam && (
           <section className="stack">
             <div className="card">
               <div className="section-head">
                 <div>
                   <h2>채점 결과</h2>
                   <p>{exam.title}</p>
+                  <div className="pill-row">
+                    <div className="pill">{gradingMode === "groq" ? "Groq AI 채점" : "로컬 채점"}</div>
+                  </div>
                 </div>
                 <div className="button-row">
                   <button className="btn ghost" onClick={() => setStep("exam")}>
@@ -874,6 +932,7 @@ export default function App() {
                       setAnswers({});
                       setFlags({});
                       setCurrentIndex(0);
+                      resetGradingState();
                       setStep("exam");
                     }}
                   >
@@ -882,104 +941,119 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="summary-grid">
-                <div className="summary-card">
-                  <div className="summary-title">총점</div>
-                  <div className="summary-value">{summary.accuracy}%</div>
-                  <div className="summary-meta">정답률</div>
-                </div>
-                <div className="summary-card">
-                  <div className="summary-title">정답</div>
-                  <div className="summary-value ok">{summary.correct}</div>
-                  <div className="summary-meta">/ {summary.total}</div>
-                </div>
-                <div className="summary-card">
-                  <div className="summary-title">오답</div>
-                  <div className="summary-value bad">{summary.incorrect}</div>
-                  <div className="summary-meta">다시 보기 추천</div>
-                </div>
-                <div className="summary-card">
-                  <div className="summary-title">미답</div>
-                  <div className="summary-value">{summary.unanswered}</div>
-                  <div className="summary-meta">답안을 확인하세요</div>
-                </div>
-              </div>
+              {gradingLoading && <div className="alert warn">AI 채점 중...</div>}
+              {gradingError && <div className="alert error">{gradingError}</div>}
 
-              <div className="filter-row">
-                <div className="pill">필터</div>
-                {([
-                  { id: "all", label: "전체" },
-                  { id: "incorrect", label: "오답만" },
-                  { id: "flagged", label: "플래그" },
-                  { id: "unanswered", label: "미답" },
-                ] as { id: ResultFilter; label: string }[]).map((option) => (
-                  <button
-                    key={option.id}
-                    className={`chip ${filter === option.id ? "active" : ""}`}
-                    onClick={() => setFilter(option.id)}
-                  >
-                    {option.label}
-                  </button>
-                ))}
-
-                <div className="button-row">
-                  <button className="btn outline" onClick={handleExportWrongNotes}>
-                    오답노트(텍스트)
-                  </button>
-                  <button className="btn outline" onClick={handleExportFlaggedNotes}>
-                    플래그 노트(텍스트)
-                  </button>
-                  <button className="btn outline" onClick={handleExportCombinedNotes}>
-                    플래그+오답(텍스트)
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div className="stack">
-              {summary.results
-                .filter((result) => {
-                  if (filter === "incorrect") {
-                    return !result.correct && result.answered;
-                  }
-                  if (filter === "flagged") {
-                    return flags[result.id];
-                  }
-                  if (filter === "unanswered") {
-                    return !result.answered;
-                  }
-                  return true;
-                })
-                .map((result, index) => (
-                  <div
-                    key={`${result.id}-${index}`}
-                    className={`card result-card ${result.correct ? "ok" : result.answered ? "bad" : "unanswered"}`}
-                  >
-                    <div className="result-head">
-                      <div className="pill">문항 {result.id}</div>
-                      <div className={`result-status ${result.correct ? "ok" : result.answered ? "bad" : "unanswered"}`}>
-                        {result.correct ? "정답" : result.answered ? "오답" : "미답"}
-                      </div>
-                      {flags[result.id] && <div className="pill">플래그</div>}
+              {summary ? (
+                <>
+                  <div className="summary-grid">
+                    <div className="summary-card">
+                      <div className="summary-title">총점</div>
+                      <div className="summary-value">{summary.accuracy}%</div>
+                      <div className="summary-meta">정답률</div>
                     </div>
-                    <h3>{result.prompt}</h3>
-                    <div className="result-row">
-                      <span className="label">내 답</span>
-                      <span>{result.userAnswerLabel}</span>
+                    <div className="summary-card">
+                      <div className="summary-title">정답</div>
+                      <div className="summary-value ok">{summary.correct}</div>
+                      <div className="summary-meta">/ {summary.total}</div>
                     </div>
-                    <div className="result-row">
-                      <span className="label">정답</span>
-                      <span>{result.correctAnswerLabel}</span>
+                    <div className="summary-card">
+                      <div className="summary-title">오답</div>
+                      <div className="summary-value bad">{summary.incorrect}</div>
+                      <div className="summary-meta">다시 보기 추천</div>
                     </div>
-                    {result.explanation && (
-                      <details>
-                        <summary>해설 보기</summary>
-                        <p>{result.explanation}</p>
-                      </details>
-                    )}
+                    <div className="summary-card">
+                      <div className="summary-title">미답</div>
+                      <div className="summary-value">{summary.unanswered}</div>
+                      <div className="summary-meta">답안을 확인하세요</div>
+                    </div>
                   </div>
-                ))}
+
+                  <div className="filter-row">
+                    <div className="pill">필터</div>
+                    {([
+                      { id: "all", label: "전체" },
+                      { id: "incorrect", label: "오답만" },
+                      { id: "flagged", label: "플래그" },
+                      { id: "unanswered", label: "미답" },
+                    ] as { id: ResultFilter; label: string }[]).map((option) => (
+                      <button
+                        key={option.id}
+                        className={`chip ${filter === option.id ? "active" : ""}`}
+                        onClick={() => setFilter(option.id)}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+
+                    <div className="button-row">
+                      <button className="btn outline" onClick={handleExportWrongNotes}>
+                        오답노트(텍스트)
+                      </button>
+                      <button className="btn outline" onClick={handleExportFlaggedNotes}>
+                        플래그 노트(텍스트)
+                      </button>
+                      <button className="btn outline" onClick={handleExportCombinedNotes}>
+                        플래그+오답(텍스트)
+                      </button>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="muted">채점 결과를 불러오는 중입니다.</div>
+              )}
             </div>
+
+            {summary && (
+              <div className="stack">
+                {summary.results
+                  .filter((result) => {
+                    if (filter === "incorrect") {
+                      return !result.correct && result.answered;
+                    }
+                    if (filter === "flagged") {
+                      return flags[result.id];
+                    }
+                    if (filter === "unanswered") {
+                      return !result.answered;
+                    }
+                    return true;
+                  })
+                  .map((result, index) => (
+                    <div
+                      key={`${result.id}-${index}`}
+                      className={`card result-card ${result.correct ? "ok" : result.answered ? "bad" : "unanswered"}`}
+                    >
+                      <div className="result-head">
+                        <div className="pill">문항 {result.id}</div>
+                        <div
+                          className={`result-status ${
+                            result.correct ? "ok" : result.answered ? "bad" : "unanswered"
+                          }`}
+                        >
+                          {result.correct ? "정답" : result.answered ? "오답" : "미답"}
+                        </div>
+                        {flags[result.id] && <div className="pill">플래그</div>}
+                      </div>
+                      <h3>{result.prompt}</h3>
+                      <div className="result-row">
+                        <span className="label">내 답</span>
+                        <span>{result.userAnswerLabel}</span>
+                      </div>
+                      <div className="result-row">
+                        <span className="label">정답</span>
+                        <span>{result.correctAnswerLabel}</span>
+                      </div>
+                      {result.explanation && (
+                        <details>
+                          <summary>해설 보기</summary>
+                          <p>{result.explanation}</p>
+                        </details>
+                      )}
+                    </div>
+                  ))}
+              </div>
+            )}
           </section>
         )}
       </main>

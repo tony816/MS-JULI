@@ -1,3 +1,7 @@
+import type { ExamData, Question, UserAnswer } from "./types";
+import { gradeExam, isAnswered, type GradeSummary } from "./grading";
+import { formatChoiceLabel } from "./utils";
+
 const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "llama-3.1-8b-instant";
 const GROQ_MAX_TOKENS = 4096;
@@ -11,6 +15,36 @@ interface GroqMessage {
 interface GroqResponse {
   choices?: Array<{ message?: { content?: string | null } }>;
   error?: { message?: string };
+}
+
+interface GroqGradeResult {
+  id?: string;
+  correct?: boolean | string | null;
+}
+
+interface GroqGradeResponse {
+  results?: GroqGradeResult[];
+}
+
+interface GradingChoice {
+  index: number;
+  label: string;
+  text: string;
+}
+
+interface GradingItem {
+  id: string;
+  type: Question["type"];
+  prompt: string;
+  choices?: GradingChoice[];
+  correct: {
+    indices: number[];
+    text: string[];
+  };
+  user: {
+    indices: number[];
+    text?: string;
+  };
 }
 
 const SYSTEM_PROMPT = [
@@ -43,6 +77,23 @@ const SYSTEM_PROMPT = [
   "- For O/X, set answer as 0 (O) or 1 (X).",
   "- Omit optional fields when not needed.",
 ].join("\n");
+
+const GRADING_SYSTEM_PROMPT = [
+  "You grade exam answers for the exam-grader app.",
+  "Decide whether each user's answer is correct using the official answers provided.",
+  "Input JSON: { items: [ { id, type, prompt, choices?, correct: { indices, text }, user: { indices, text? } } ] }",
+  "choices entries are { index, label, text } when present.",
+  "Rules:",
+  "- Indices are 0-based.",
+  "- single/ox: correct if user.indices has exactly one value equal to correct.indices[0].",
+  "- multi: correct if user.indices set equals correct.indices set (order does not matter).",
+  "- short: correct if user.text matches any correct.text semantically (ignore case/spacing/punctuation; allow common synonyms).",
+  "- If there is no official answer, mark correct as false.",
+  "Return only JSON with schema: {\"results\":[{\"id\":\"Q1\",\"correct\":true}]}",
+  "Return one result per input item in the same order.",
+].join("\n");
+
+const GROQ_GRADING_MAX_TOKENS = 2048;
 
 function getExpectedQuestionCount(input: string): number | null {
   const patterns = [
@@ -289,28 +340,159 @@ function parseJsonFromText(text: string): unknown {
   throw buildParseError(cleaned);
 }
 
-export async function parseExamWithGroq(input: string): Promise<unknown> {
-  const apiKey = import.meta.env.VITE_GROQ_API_KEY;
-  if (!apiKey) {
-    throw new Error("VITE_GROQ_API_KEY가 설정되지 않았습니다.");
+function normalizeIndices(values: number[]): number[] {
+  return Array.from(new Set(values))
+    .filter((value) => typeof value === "number" && Number.isFinite(value))
+    .sort((a, b) => a - b);
+}
+
+function toIndexArray(value: UserAnswer | number | number[] | null | undefined): number[] {
+  if (Array.isArray(value)) {
+    return normalizeIndices(value);
+  }
+  if (typeof value === "number") {
+    return normalizeIndices([value]);
+  }
+  return [];
+}
+
+function buildChoiceEntries(question: Question): GradingChoice[] {
+  const baseChoices =
+    question.type === "ox" && (!question.choices || question.choices.length === 0)
+      ? ["O", "X"]
+      : question.choices ?? [];
+
+  if (!baseChoices.length) {
+    return [];
   }
 
-  const requestGroq = async (useJsonMode: boolean): Promise<string> => {
-    const body = {
-      model: GROQ_MODEL,
-      temperature: GROQ_TEMPERATURE,
-      max_tokens: GROQ_MAX_TOKENS,
-      messages: buildMessages(input),
-      ...(useJsonMode ? { response_format: { type: "json_object" } } : {}),
+  return baseChoices.map((text, index) => {
+    const label =
+      question.type === "ox"
+        ? question.choiceLabels?.[index] ?? (index === 0 ? "O" : "X")
+        : formatChoiceLabel(question, index);
+    return { index, label, text };
+  });
+}
+
+function buildGradingItems(exam: ExamData, answers: Record<string, UserAnswer>): GradingItem[] {
+  const items: GradingItem[] = [];
+
+  for (const question of exam.questions) {
+    const userAnswer = answers[question.id] ?? null;
+    if (!isAnswered(question, userAnswer)) {
+      continue;
+    }
+
+    const correctIndices = toIndexArray(question.answer ?? null);
+    const userIndices = toIndexArray(userAnswer);
+    const userText = typeof userAnswer === "string" ? userAnswer.trim() : "";
+    const choices = buildChoiceEntries(question);
+
+    const item: GradingItem = {
+      id: question.id,
+      type: question.type,
+      prompt: question.prompt,
+      correct: {
+        indices: correctIndices,
+        text: question.answerText ? [...question.answerText] : [],
+      },
+      user: {
+        indices: userIndices,
+      },
     };
 
+    if (choices.length) {
+      item.choices = choices;
+    }
+
+    if (userText) {
+      item.user.text = userText;
+    }
+
+    items.push(item);
+  }
+
+  return items;
+}
+
+function normalizeCorrectValue(value: unknown): boolean | null {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "string") {
+    const lower = value.trim().toLowerCase();
+    if (lower === "true") {
+      return true;
+    }
+    if (lower === "false") {
+      return false;
+    }
+  }
+  return null;
+}
+
+function parseGradingResults(payload: unknown): Map<string, boolean> {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Groq grading response invalid.");
+  }
+
+  const results = (payload as GroqGradeResponse).results;
+  if (!Array.isArray(results)) {
+    throw new Error("Groq grading response invalid.");
+  }
+
+  const map = new Map<string, boolean>();
+  for (const entry of results) {
+    if (!entry) {
+      continue;
+    }
+    const id = typeof entry.id === "string" ? entry.id : "";
+    const correct = normalizeCorrectValue(entry.correct);
+    if (id && correct !== null) {
+      map.set(id, correct);
+    }
+  }
+
+  if (!map.size) {
+    throw new Error("Groq grading response missing results.");
+  }
+
+  return map;
+}
+
+async function requestGroq(
+  messages: GroqMessage[],
+  options: {
+    useJsonMode?: boolean;
+    model?: string;
+    maxTokens?: number;
+    temperature?: number;
+  } = {}
+): Promise<string> {
+  const apiKey = import.meta.env.VITE_GROQ_API_KEY;
+  if (!apiKey) {
+    throw new Error("Missing VITE_GROQ_API_KEY.");
+  }
+
+  const bodyBase = {
+    model: options.model ?? GROQ_MODEL,
+    temperature: options.temperature ?? GROQ_TEMPERATURE,
+    max_tokens: options.maxTokens ?? GROQ_MAX_TOKENS,
+    messages,
+  };
+
+  const requestOnce = async (useJsonMode: boolean): Promise<string> => {
     const response = await fetch(GROQ_ENDPOINT, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        ...bodyBase,
+        ...(useJsonMode ? { response_format: { type: "json_object" } } : {}),
+      }),
     });
 
     let payload: GroqResponse | null = null;
@@ -321,29 +503,86 @@ export async function parseExamWithGroq(input: string): Promise<unknown> {
     }
 
     if (!response.ok) {
-      const detail = payload?.error?.message || `Groq 요청 실패 (${response.status})`;
+      const detail = payload?.error?.message || `Groq request failed (${response.status})`;
       throw new Error(detail);
     }
 
     const content = payload?.choices?.[0]?.message?.content;
     if (!content) {
-      throw new Error("Groq 응답이 비어 있습니다.");
+      throw new Error("Groq response missing content.");
     }
 
     return content;
   };
 
-  let content: string;
-  try {
-    content = await requestGroq(true);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "";
-    if (message.includes("response_format") || message.includes("json_object")) {
-      content = await requestGroq(false);
-    } else {
-      throw error;
-    }
+  if (!options.useJsonMode) {
+    return requestOnce(false);
   }
 
+  try {
+    return await requestOnce(true);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    const lowered = message.toLowerCase();
+    if (
+      lowered.includes("response_format") ||
+      lowered.includes("json_object") ||
+      lowered.includes("failed_generation") ||
+      lowered.includes("failed to generate json")
+    ) {
+      return requestOnce(false);
+    }
+    throw error;
+  }
+}
+
+export async function parseExamWithGroq(input: string): Promise<unknown> {
+  const content = await requestGroq(buildMessages(input), { useJsonMode: true });
   return parseJsonFromText(content);
+}
+
+export async function gradeExamWithGroq(
+  exam: ExamData,
+  answers: Record<string, UserAnswer>
+): Promise<GradeSummary> {
+  const base = gradeExam(exam, answers);
+  const items = buildGradingItems(exam, answers);
+
+  if (!items.length) {
+    return base;
+  }
+
+  const content = await requestGroq(
+    [
+      { role: "system", content: GRADING_SYSTEM_PROMPT },
+      { role: "user", content: JSON.stringify({ items }) },
+    ],
+    { useJsonMode: true, maxTokens: GROQ_GRADING_MAX_TOKENS }
+  );
+
+  const parsed = parseJsonFromText(content);
+  const gradingMap = parseGradingResults(parsed);
+
+  const results = base.results.map((result) => {
+    const override = gradingMap.get(result.id);
+    if (typeof override !== "boolean") {
+      return result;
+    }
+    return { ...result, correct: override };
+  });
+
+  const total = results.length;
+  const correct = results.filter((item) => item.correct).length;
+  const unanswered = results.filter((item) => !item.answered).length;
+  const incorrect = total - correct - unanswered;
+  const accuracy = total ? Math.round((correct / total) * 100) : 0;
+
+  return {
+    total,
+    correct,
+    incorrect,
+    unanswered,
+    accuracy,
+    results,
+  };
 }
